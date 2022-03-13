@@ -1,0 +1,321 @@
+package server
+
+import (
+	"embed"
+	"fmt"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path"
+	"strings"
+
+	v1 "github.com/YunFreeTech/kubefree/internal/model/v1"
+	"k8s.io/klog/v2"
+
+	"github.com/YunFreeTech/kubefree/internal/config"
+	v1Config "github.com/YunFreeTech/kubefree/internal/model/v1/config"
+	"github.com/YunFreeTech/kubefree/migrate"
+	"github.com/YunFreeTech/kubefree/pkg/file"
+	"github.com/YunFreeTech/kubefree/pkg/i18n"
+	"github.com/asdine/storm/v3"
+	"github.com/coreos/etcd/pkg/fileutil"
+	"github.com/kataras/iris/v12"
+	"github.com/kataras/iris/v12/context"
+	"github.com/kataras/iris/v12/sessions"
+	"github.com/kataras/iris/v12/view"
+	"github.com/sirupsen/logrus"
+)
+
+const sessionCookieName = "SESS_COOKIE_KUBEFREE"
+
+var EmbedWebKubeFree embed.FS
+var EmbedWebDashboard embed.FS
+var EmbedWebTerminal embed.FS
+var WebkubectlEntrypoint string
+
+type Option func(server *KubeFreeServer)
+
+func WithServerBindHost(host string) Option {
+	return func(server *KubeFreeServer) {
+		if host != "" {
+			server.config.Spec.Server.Bind.Host = host
+		}
+	}
+}
+
+func WithServerBindPort(port int) Option {
+	return func(server *KubeFreeServer) {
+		if port != 0 {
+			server.config.Spec.Server.Bind.Port = port
+		}
+	}
+}
+
+func WithCustomConfigFilePath(path string) Option {
+	return func(server *KubeFreeServer) {
+		if path != "" {
+			server.configCustomFilePath = path
+		}
+	}
+}
+
+type KubeFreeServer struct {
+	app                  *iris.Application
+	db                   *storm.DB
+	logger               *logrus.Logger
+	configCustomFilePath string
+	config               *v1Config.Config
+	rootRoute            iris.Party
+}
+
+func NewKubeFreeSerer(opts ...Option) *KubeFreeServer {
+	c := &KubeFreeServer{}
+	c.app = iris.New()
+	c.config = getDefaultConfig()
+	for _, op := range opts {
+		op(c)
+	}
+	c.setUpConfig()
+	for _, op := range opts {
+		op(c)
+	}
+	return c.bootstrap()
+}
+
+func (e *KubeFreeServer) setUpConfig() {
+	err := config.ReadConfig(e.config, e.configCustomFilePath)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (e *KubeFreeServer) setUpLogger() {
+	klog.SetLogger(TodoLogger{})
+	e.logger = logrus.New()
+	l, err := logrus.ParseLevel(e.config.Spec.Logger.Level)
+	if err != nil {
+		e.logger.Errorf("cant not parse logger level %s, %s,use default level: INFO", e.config.Spec.Logger.Level, err)
+	}
+	e.logger.SetLevel(l)
+}
+
+func (e *KubeFreeServer) setUpDB() {
+	realDir := file.ReplaceHomeDir(e.config.Spec.DB.Path)
+	if !fileutil.Exist(realDir) {
+		if err := os.MkdirAll(realDir, 0755); err != nil {
+			panic(fmt.Errorf("can not create database dir: %s message: %s", e.config.Spec.DB.Path, err))
+		}
+	}
+	d, err := storm.Open(path.Join(realDir, "kubefree.db"))
+	if err != nil {
+		panic(err)
+	}
+	e.db = d
+}
+
+func (e *KubeFreeServer) setUpRootRoute() {
+	e.app.Any("/", func(ctx *context.Context) {
+		ctx.Redirect("/kubefree")
+	})
+	e.rootRoute = e.app.Party("/kubefree")
+}
+
+func (e *KubeFreeServer) setUpStaticFile() {
+	spaOption := iris.DirOptions{SPA: true, IndexName: "index.html"}
+	party := e.rootRoute.Party("/")
+	party.Use(iris.Compression)
+	dashboardFS := iris.PrefixDir("web/dashboard", http.FS(EmbedWebDashboard))
+	party.RegisterView(view.HTML(dashboardFS, ".html"))
+	party.HandleDir("/dashboard/", dashboardFS, spaOption)
+
+	terminalFS := iris.PrefixDir("web/terminal", http.FS(EmbedWebTerminal))
+	party.RegisterView(view.HTML(terminalFS, ".html"))
+	party.HandleDir("/terminal/", terminalFS, spaOption)
+
+	kubePiFS := iris.PrefixDir("web/kubefree", http.FS(EmbedWebKubeFree))
+	party.RegisterView(view.HTML(kubePiFS, ".html"))
+	party.HandleDir("/", kubePiFS, spaOption)
+}
+
+func (e *KubeFreeServer) setUpSession() {
+	sess := sessions.New(sessions.Config{Cookie: sessionCookieName, AllowReclaim: true})
+	e.rootRoute.Use(sess.Handler())
+}
+
+const ContentTypeDownload = "application/download"
+
+func (e *KubeFreeServer) setResultHandler() {
+	e.rootRoute.Use(func(ctx *context.Context) {
+		ctx.Next()
+		contentType := ctx.ResponseWriter().Header().Get("Content-Type")
+		if contentType == ContentTypeDownload {
+			return
+		}
+		isProxyPath := func() bool {
+			p := ctx.GetCurrentRoute().Path()
+			ss := strings.Split(p, "/")
+			if len(ss) > 0 {
+				if ss[0] == "webkubectl" {
+					return true
+				}
+			}
+			if len(ss) >= 3 {
+				for i := range ss {
+					if ss[i] == "proxy" || ss[i] == "ws" {
+						return true
+					}
+				}
+			}
+			return false
+		}()
+		if !isProxyPath {
+			if ctx.GetStatusCode() >= iris.StatusOK && ctx.GetStatusCode() < iris.StatusBadRequest {
+				resp := iris.Map{
+					"success": true,
+					"data":    ctx.Values().Get("data"),
+				}
+				_, _ = ctx.JSON(resp)
+			}
+		}
+	})
+}
+
+func (e *KubeFreeServer) setUpErrHandler() {
+	e.rootRoute.OnAnyErrorCode(func(ctx iris.Context) {
+		if ctx.Values().GetString("message") == "" {
+			switch ctx.GetStatusCode() {
+			case iris.StatusNotFound:
+				ctx.Values().Set("message", "the server could not find the requested resource")
+			}
+		}
+		message := ctx.Values().Get("message")
+		lang := ctx.Values().GetString("language")
+		var (
+			translateMessage string
+			err              error
+			originMessage    string
+		)
+
+		switch value := message.(type) {
+		case string:
+			originMessage = message.(string)
+			translateMessage, err = i18n.Translate(lang, value)
+		case []string:
+			originMessage = strings.Join(value, ",")
+			if len(value) > 0 {
+				translateMessage, err = i18n.Translate(lang, value[0], value[1:])
+			}
+		}
+		msg := translateMessage
+		if err != nil {
+			e.app.Logger().Debug(err)
+			msg = originMessage
+		}
+		er := iris.Map{
+			"success": false,
+			"code":    ctx.GetStatusCode(),
+			"message": msg,
+		}
+		_, _ = ctx.JSON(er)
+	})
+}
+
+func (e *KubeFreeServer) runMigrations() {
+	migrate.RunMigrate(e.db, e.logger)
+}
+func (e *KubeFreeServer) setWebkubectlProxy() {
+	handler := func(ctx *context.Context) {
+		p := ctx.Params().Get("p")
+		if strings.Contains(p, "root") {
+			ctx.Request().URL.Path = strings.ReplaceAll(ctx.Request().URL.Path, "root", "")
+			ctx.Request().RequestURI = strings.ReplaceAll(ctx.Request().RequestURI, "root", "")
+		}
+		u, _ := url.Parse("http://localhost:8080")
+		proxy := httputil.NewSingleHostReverseProxy(u)
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			if resp.StatusCode == iris.StatusMovedPermanently {
+				// 重定向重写
+				if resp.Header.Get("Location") == "/kubefree/webkubectl/" {
+					resp.Header.Set("Location", "/kubefree/webkubectl/root")
+				}
+			}
+			return nil
+		}
+		proxy.ServeHTTP(ctx.ResponseWriter(), ctx.Request())
+	}
+	e.rootRoute.Any("/webkubectl/{p:path}", handler)
+	e.rootRoute.Any("webkubectl", handler)
+}
+
+func (e *KubeFreeServer) setUpTtyEntrypoint() {
+	f, err := os.OpenFile("init-kube.sh", os.O_CREATE|os.O_RDWR, 0755)
+	if err != nil {
+		e.logger.Error(err)
+		return
+	}
+	if _, err := f.WriteString(WebkubectlEntrypoint); err != nil {
+		e.logger.Error(err)
+		return
+	}
+}
+
+func (e *KubeFreeServer) bootstrap() *KubeFreeServer {
+	e.setUpRootRoute()
+	e.setUpStaticFile()
+	e.setUpLogger()
+	e.setUpDB()
+	e.setUpSession()
+	e.setResultHandler()
+	e.setUpErrHandler()
+	e.setWebkubectlProxy()
+	e.runMigrations()
+	e.setUpTtyEntrypoint()
+	//e.startTty()
+	return e
+}
+
+var es *KubeFreeServer
+
+func DB() *storm.DB {
+	return es.db
+}
+
+func Config() *v1Config.Config {
+	return es.config
+}
+
+func Logger() *logrus.Logger {
+	return es.logger
+}
+
+func Listen(route func(party iris.Party), options ...Option) error {
+	es = NewKubeFreeSerer(options...)
+	route(es.rootRoute)
+	return es.app.Run(iris.Addr(fmt.Sprintf("%s:%d", es.config.Spec.Server.Bind.Host, es.config.Spec.Server.Bind.Port)))
+}
+
+func getDefaultConfig() *v1Config.Config {
+	return &v1Config.Config{
+		BaseModel: v1.BaseModel{
+			ApiVersion: "v1",
+			Kind:       "AppConfig",
+		},
+		Metadata: v1.Metadata{},
+		Spec: v1Config.Spec{
+			Server: v1Config.ServerConfig{
+				Bind: v1Config.BindConfig{
+					Host: "0.0.0.0",
+					Port: 80,
+				},
+				SSL: v1Config.SSLConfig{
+					Enable: false,
+				},
+			},
+			DB: v1Config.DBConfig{
+				Path: "/var/lib/kubefree/db",
+			},
+			Logger: v1Config.LoggerConfig{Level: "debug"},
+		},
+	}
+}

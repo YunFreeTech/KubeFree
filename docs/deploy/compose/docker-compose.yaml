@@ -1,0 +1,10 @@
+version: "2.2"
+services:
+  kubefree:
+    image: YunFreeTech/kubefree-server:latest
+    container_name: kubefree
+    restart: unless-stopped
+    ports:
+      - 80:80
+    volumes:
+      - ./kubefree:/var/lib/kubefree

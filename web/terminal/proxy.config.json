@@ -1,0 +1,5 @@
+{
+  "/kubefree/api/": {
+    "target": "http://localhost:80"
+  }
+}
